@@ -2,10 +2,12 @@
 
 # Senhas e chaves
 .env
+# Chave da conta robô do Google (arquivo .json): é senha, nunca vai para o GitHub
+*.json
 
-# Registro das cotações (tem telefones de clientes - LGPD)
-# O * cobre também as cópias antigas, ex.: cotacoes_registradas_antigo.csv
-dados/cotacoes_registradas*.csv
+# Dados da empresa (tabela de preços, cidades, registro de cotações):
+# ficam no Google Drive, nunca no GitHub
+dados/
 
 # Arquivos temporários do Python e do VS Code
 __pycache__/

@@ -9,7 +9,6 @@ Senhas e tokens NÃO ficam escritos no código: eles são lidos do arquivo
 professor sem expor as chaves da empresa.
 """
 import os
-from pathlib import Path
 
 # Tenta carregar o arquivo .env (se a biblioteca python-dotenv estiver instalada)
 try:
@@ -19,14 +18,29 @@ except ImportError:
     pass
 
 # ---------------------------------------------------------------
-# Arquivos
+# Dados no Google Drive
 # ---------------------------------------------------------------
-PASTA = Path(__file__).parent
-ARQ_TABELA = PASTA / "dados" / "TabelaCotacao.xlsx"       # tabela de preços (peso x distância)
-ABA_TABELA = "TabelaCotação"                              # nome da aba dentro do Excel
-ARQ_MUNICIPIOS = PASTA / "dados" / "municipios.csv"       # cidades do Brasil com latitude/longitude
-ARQ_ESTADOS = PASTA / "dados" / "estados.csv"
-ARQ_REGISTRO = PASTA / "dados" / "cotacoes_registradas.csv"  # histórico das cotações feitas pelo bot
+# Os dados NÃO ficam no GitHub: ficam na pasta privada "Chatbot Deflo - Dados"
+# do Google Drive, e o bot busca de lá (veja todos_drive.py).
+# O ID da pasta e o caminho da chave da conta robô vêm do .env / Render.
+DRIVE_PASTA_ID = os.getenv("DRIVE_PASTA_ID", "")
+GOOGLE_CREDENCIAIS_ARQUIVO = os.getenv("GOOGLE_CREDENCIAIS_ARQUIVO", "")
+
+# Nomes dos arquivos dentro da pasta do Drive (têm que ser exatamente estes)
+NOME_TABELA = "TabelaCotacao.xlsx"            # tabela de preços (peso x distância)
+ABA_TABELA = "TabelaCotação"                  # nome da aba dentro do Excel
+NOME_MUNICIPIOS = "municipios.csv"            # cidades do Brasil com latitude/longitude
+NOME_ESTADOS = "estados.csv"
+NOME_PLANILHA_REGISTRO = "cotacoes_registradas"   # planilha Google com o histórico das cotações
+NOME_PLANILHA_EMAILS = "emails_registrados"       # planilha Google com o histórico dos e-mails
+NOME_PLANILHA_CONHECIMENTO = "base_conhecimento"  # planilha Google onde o bot anota o que não soube responder
+
+# De quantos em quantos minutos o bot busca a tabela de preços de novo no Drive.
+# Assim, se o dono atualizar os preços, o bot passa a usar a tabela nova sozinho.
+TABELA_ATUALIZAR_MIN = 10
+# O mesmo para a base de conhecimento: depois de aprovar uma resposta na planilha,
+# o bot passa a usar ela dentro desse tempo, sem precisar publicar código novo.
+CONHECIMENTO_ATUALIZAR_MIN = 5
 
 # ---------------------------------------------------------------
 # Empresa
@@ -45,10 +59,33 @@ DIAS_FUNCIONAMENTO = {0, 1, 2, 3, 4, 5, 6}
 # Todo chamado de atendente recebe um protocolo, ex.: ATD-04102026-1432-K7
 # (dia/mês/ano - hora:minuto - código sorteado). Aparece no Telegram e para o cliente.
 PREFIXO_PROTOCOLO = "ATD"
+# E-mail novo também recebe protocolo, com outro começo (M de e-mail), ex.: ATM-04102026-1432-K7.
+# Assim, um e-mail e uma mensagem de WhatsApp no mesmo minuto nunca têm o mesmo número.
+PREFIXO_PROTOCOLO_EMAIL = "ATM"
 # O atendente responde o cliente pelo WhatsApp OFICIAL da empresa (não pelo número do bot).
 # Se preencher o número abaixo (ex.: "(61) 90000-0000"), ele aparece na mensagem ao cliente.
 # Deixe vazio ("") para mostrar só "WhatsApp oficial da empresa".
 WHATSAPP_OFICIAL_EMPRESA = ""
+
+# ---------------------------------------------------------------
+# CNPJ do cliente
+# ---------------------------------------------------------------
+# A empresa transporta só para outras empresas, então a conversa começa pedindo
+# o CNPJ. O bot confere os dígitos verificadores (conta do módulo 11), sem
+# consultar nada na internet: assim ele nunca barra uma empresa recém-aberta.
+# A conferência cadastral (existe? é dessa empresa?) é feita pelo atendente.
+# Para desligar a exigência, troque para False.
+EXIGIR_CNPJ = True
+# O bot pede os 14 caracteres sem ponto, barra ou traço, para todo mundo responder
+# igual. Na planilha e no Telegram a máscara é colocada de volta pelo código.
+# Com False, o bot também aceita o CNPJ digitado com máscara.
+CNPJ_SO_NUMEROS = True
+# Quantas vezes o cliente pode errar o CNPJ antes de o bot chamar um atendente.
+CNPJ_TENTATIVAS = 3
+# Depois do CNPJ, o bot pergunta o primeiro nome do cliente e usa durante a
+# conversa. O nome é cortesia, e NÃO exigência: se o cliente não quiser dizer,
+# a conversa segue normalmente. Com False, o bot não pergunta.
+PERGUNTAR_NOME = True
 
 # ---------------------------------------------------------------
 # Regras da cotação
@@ -68,15 +105,45 @@ FATOR_CUBAGEM = 300
 # ---------------------------------------------------------------
 # Comportamento da conversa
 # ---------------------------------------------------------------
-TEMPO_SESSAO_MIN = 30           # sem mensagens por 30 min -> conversa recomeça
+# O bot é uma ferramenta rápida de cotação. Por isso ele NUNCA fica bloqueado
+# esperando um atendente: depois de encaminhar, a próxima mensagem do cliente já
+# é uma cotação nova, com CNPJ e protocolo novos.
+TEMPO_SESSAO_MIN = 15           # sem mensagens por 15 min -> conversa recomeça (e o CNPJ é pedido de novo)
 LEMBRETE_MIN = 10               # cliente parou no meio da cotação por 10 min -> bot lembra o que falta
-PAUSA_ATENDENTE_HORAS = 12      # depois de chamar atendente, por 12h o bot só lembra o protocolo (MENU volta ao bot)
+# Quantas vezes seguidas o bot tenta antes de chamar o atendente.
+# Com 2: na 3ª vez que o bot não entende (ou que o cliente repete a mesma pergunta),
+# ele para de insistir e passa o cliente para o atendente.
+INSISTENCIA_MAXIMA = 2
+
+# ---------------------------------------------------------------
+# Resumo da base de conhecimento (Telegram)
+# ---------------------------------------------------------------
+# Uma vez por semana, o bot manda UMA mensagem com as perguntas que ele não
+# soube responder, para alguém escrever as respostas na planilha com calma.
+# Uma mensagem por semana não atrapalha o canal de alertas. Para desligar,
+# troque para False.
+RESUMO_LIGADO = True
+RESUMO_DIA = 6                  # 0 = segunda ... 6 = domingo
+RESUMO_HORA = 9                 # hora cheia em que o resumo é enviado
+RESUMO_MAXIMO_PERGUNTAS = 10    # quantas perguntas aparecem na mensagem
+RESUMO_VERIFICAR_SEG = 600      # de quanto em quanto tempo o bot olha se é a hora
 
 # ---------------------------------------------------------------
 # Alerta para o celular do atendente (Telegram)
 # ---------------------------------------------------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+# Senha do webhook do Telegram. O Telegram devolve ela em todo aviso de botão
+# tocado, e o servidor recusa o que vier sem ela. Invente uma frase qualquer.
+TELEGRAM_SEGREDO = os.getenv("TELEGRAM_SEGREDO", "")
+
+# ---------------------------------------------------------------
+# Aviso de e-mail novo no Telegram (todos_email.py)
+# ---------------------------------------------------------------
+EMAIL_ENDERECO = os.getenv("EMAIL_ENDERECO", "")
+EMAIL_SENHA_APP = os.getenv("EMAIL_SENHA_APP", "")     # senha de app do Google, NÃO a senha normal
+EMAIL_IMAP_SERVIDOR = "imap.gmail.com"
+EMAIL_VERIFICAR_SEG = 60                               # olha a caixa de entrada a cada 1 minuto
 
 # ---------------------------------------------------------------
 # WhatsApp (API oficial da Meta — WhatsApp Cloud API)
