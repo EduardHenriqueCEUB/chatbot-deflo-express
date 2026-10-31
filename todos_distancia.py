@@ -3,7 +3,7 @@ Encontra a cidade que o cliente digitou e calcula a distância.
 
 Como funciona:
   1. Temos um arquivo com as 5.570 cidades do Brasil e a latitude/longitude
-     de cada uma (dados/municipios.csv).
+     de cada uma (municipios.csv, na pasta de dados do Google Drive).
   2. O cliente digita algo como "goiania - go", "Goiânia/GO" ou só "goiania".
      A gente "normaliza" o texto (tira acento, deixa maiúsculo) e procura.
   3. Com as coordenadas das duas cidades, calculamos a distância em linha
@@ -17,11 +17,13 @@ Funções principais:
 """
 import csv
 import difflib
+import io
 import math
 import re
 import unicodedata
 
 import todos_config as config
+import todos_drive as drive
 
 
 def normalizar(texto):
@@ -31,24 +33,32 @@ def normalizar(texto):
     return " ".join(so_letras.split())                           # tira espaços repetidos
 
 
+def _ler_csv_do_drive(nome):
+    """Baixa um CSV da pasta de dados do Drive e devolve as linhas como dicionários."""
+    texto = drive.baixar_arquivo(nome).decode("utf-8-sig")
+    return csv.DictReader(io.StringIO(texto))
+
+
 def _carregar_cidades():
-    """Monta um dicionário: nome normalizado -> lista de cidades com esse nome."""
+    """
+    Monta um dicionário: nome normalizado -> lista de cidades com esse nome.
+    As listas de cidades e estados quase nunca mudam, então são baixadas
+    do Drive uma vez só, quando o programa inicia.
+    """
     siglas = {}
-    with open(config.ARQ_ESTADOS, encoding="utf-8-sig") as f:
-        for linha in csv.DictReader(f):
-            siglas[linha["codigo_uf"]] = linha["uf"]
+    for linha in _ler_csv_do_drive(config.NOME_ESTADOS):
+        siglas[linha["codigo_uf"]] = linha["uf"]
 
     cidades = {}
-    with open(config.ARQ_MUNICIPIOS, encoding="utf-8-sig") as f:
-        for linha in csv.DictReader(f):
-            cidade = {
-                "nome": linha["nome"],
-                "uf": siglas[linha["codigo_uf"]],
-                "lat": float(linha["latitude"]),
-                "lon": float(linha["longitude"]),
-            }
-            # Várias cidades têm o mesmo nome (ex.: "Bom Jesus" existe em 5 estados)
-            cidades.setdefault(normalizar(linha["nome"]), []).append(cidade)
+    for linha in _ler_csv_do_drive(config.NOME_MUNICIPIOS):
+        cidade = {
+            "nome": linha["nome"],
+            "uf": siglas[linha["codigo_uf"]],
+            "lat": float(linha["latitude"]),
+            "lon": float(linha["longitude"]),
+        }
+        # Várias cidades têm o mesmo nome (ex.: "Bom Jesus" existe em 5 estados)
+        cidades.setdefault(normalizar(linha["nome"]), []).append(cidade)
     return cidades, set(siglas.values())
 
 
@@ -116,6 +126,80 @@ def achar_cidade_no_texto(texto):
             if len(candidatas) == 1:
                 return candidatas[0]
     return None
+
+
+def achar_ultima_cidade_no_texto(texto):
+    """
+    Procura a ÚLTIMA cidade da frase, ou seja, a que termina mais perto do fim.
+    Empate, fica com o nome mais longo ("Belo Horizonte", e não "Horizonte").
+
+    Serve para a ORIGEM, que é o pedaço da mensagem antes do "para". Numa frase
+    como "sou da empresa que tem sede em São Paulo, cotação de Goiânia para
+    Manaus", a cidade que interessa é a que está colada no "para", porque é ali
+    que o cliente está dizendo de onde a carga sai. A primeira, São Paulo, foi
+    citada de passagem.
+
+    O destino continua usando o achar_cidade_no_texto, que pega a PRIMEIRA: do
+    outro lado do "para", quem está colado é o destino, e o que vem depois é
+    conversa ("para Manaus, mas o transporte não é para mim, eu sou de Brasília").
+    """
+    palavras = normalizar(texto).split()
+    melhor, melhor_chave = None, None
+    for inicio in range(len(palavras)):
+        for fim in range(inicio + 1, len(palavras) + 1):
+            pedaco = palavras[inicio:fim]
+            uf = None
+            if len(pedaco) > 1 and pedaco[-1] in UFS:
+                uf, pedaco = pedaco[-1], pedaco[:-1]
+            if not pedaco:
+                continue
+            candidatas = CIDADES.get(" ".join(pedaco), [])
+            if uf:
+                candidatas = [c for c in candidatas if c["uf"] == uf]
+            if len(candidatas) != 1:
+                continue
+            chave = (fim, fim - inicio)      # termina mais tarde; empate, nome mais longo
+            if melhor_chave is None or chave > melhor_chave:
+                melhor, melhor_chave = candidatas[0], chave
+    return melhor
+
+
+def achar_todas_as_cidades(texto):
+    """
+    Devolve TODAS as cidades que aparecem na frase, na ordem, sem repetir.
+
+    Vai da esquerda para a direita e, em cada ponto, fica com o nome mais longo
+    que for uma cidade ("Belo Horizonte MG", e não "Horizonte"). Depois pula para
+    depois do que achou, para a mesma cidade não ser contada duas vezes.
+
+    Serve para o bot saber QUANTAS cidades o cliente citou. Quando ele cita só
+    duas, elas são a rota, e a única dúvida é qual é a origem e qual é o destino.
+    """
+    palavras = normalizar(texto).split()
+    achadas = []
+    inicio = 0
+    while inicio < len(palavras):
+        achou = None
+        for fim in range(len(palavras), inicio, -1):
+            pedaco = palavras[inicio:fim]
+            uf = None
+            if len(pedaco) > 1 and pedaco[-1] in UFS:
+                uf, pedaco = pedaco[-1], pedaco[:-1]
+            if not pedaco:
+                continue
+            candidatas = CIDADES.get(" ".join(pedaco), [])
+            if uf:
+                candidatas = [c for c in candidatas if c["uf"] == uf]
+            if len(candidatas) == 1:
+                achou = (candidatas[0], fim)
+                break
+        if achou is None:
+            inicio += 1
+            continue
+        cidade, inicio = achou
+        if cidade not in achadas:
+            achadas.append(cidade)
+    return achadas
 
 
 def distancia_km(origem, destino):
