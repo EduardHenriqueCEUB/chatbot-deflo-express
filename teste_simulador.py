@@ -32,8 +32,7 @@ def momento_atual():
 
 def mostrar(resposta):
     if resposta is None:
-        # Cliente já está com o atendente e o protocolo foi lembrado há pouco
-        print("(bot não respondeu — protocolo já lembrado há pouco; digite MENU para voltar)\n")
+        print("(o bot não respondeu nada nessa mensagem)\n")
     else:
         print(f"\nBot:\n{resposta}\n")
 
