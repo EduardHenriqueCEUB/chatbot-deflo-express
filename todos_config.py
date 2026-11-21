@@ -129,6 +129,29 @@ RESUMO_MAXIMO_PERGUNTAS = 10    # quantas perguntas aparecem na mensagem
 RESUMO_VERIFICAR_SEG = 600      # de quanto em quanto tempo o bot olha se é a hora
 
 # ---------------------------------------------------------------
+# IA do Google (Gemini) (todos_ia.py)
+# ---------------------------------------------------------------
+# A IA só entra onde as regras do bot não entendem: uma pergunta que o FAQ e a
+# base de conhecimento não respondem, ou um pedido de cotação escrito de um
+# jeito que as regras não conseguem ler. Ela NUNCA dá preço: o valor do frete
+# continua sendo calculado pelo código, pela tabela.
+# Um interruptor só: True liga a IA no teste e na produção, False desliga nos
+# dois. Desligada, o bot funciona exatamente como funcionava antes da IA.
+# Antes de ligar, preencha a GEMINI_API_KEY no .env e no painel do Render.
+IA_LIGADA = True
+# Chave da API do Gemini, criada no Google AI Studio. É senha: fica no .env
+# (teste) e no painel do Render (produção), nunca no código.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+# Modelo usado. Os "flash-lite" são os mais rápidos e têm uso gratuito.
+# Se um dia o Google aposentar este modelo, troque o nome aqui por um dos que
+# aparecem na lista de modelos do Google AI Studio.
+IA_MODELO = "gemini-3.1-flash-lite"
+# Modelo reserva: usado UMA vez quando o principal está sobrecarregado (erro 503),
+# lento demais ou sem limite gratuito. Cada modelo tem a sua própria capacidade,
+# então quando um está cheio o outro costuma responder. Deixe "" para não usar.
+IA_MODELO_RESERVA = "gemini-2.5-flash-lite"
+
+# ---------------------------------------------------------------
 # Alerta para o celular do atendente (Telegram)
 # ---------------------------------------------------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")

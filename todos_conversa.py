@@ -39,6 +39,11 @@ e oferece um atendente, em vez de fingir que entendeu e mostrar o menu.
 A pergunta também é anotada na planilha "base_conhecimento"
 (veja o todos_aprendizado.py), para virar resposta nova depois.
 
+Com a IA ligada (IA_LIGADA, no todos_config.py), o bot pede ajuda à IA do Google
+SÓ quando as regras falham: antes de admitir que não sabe, e antes de dizer que
+não entendeu um pedido de cotação (veja o todos_ia.py). O que a IA lê passa
+pelas mesmas regras de sempre, e o preço continua sendo calculado pelo código.
+
 Quando o bot chama um atendente sozinho (sem o cliente escolher a opção do menu):
   - o cliente fala de FRETE DEDICADO (um veículo só para a carga dele), com a palavra
     "dedicado", "carga fechada", "lotação" ou com o nome do caminhão ("carreta", "bitruck");
@@ -62,6 +67,7 @@ import todos_cep as cep
 import todos_cnpj as cnpj
 import todos_config as config
 import todos_faq as faq
+import todos_ia as ia
 import todos_alerta as alerta
 from todos_alerta import enviar_alerta
 from todos_distancia import (achar_cidade_no_texto, achar_todas_as_cidades,
@@ -1033,9 +1039,289 @@ def _nao_sei_responder(sessao, texto, momento=None, inicio=""):
     O bot não soube responder uma pergunta de verdade.
     Em vez de fingir que não entendeu e jogar o menu, ele admite, anota para
     aprender depois e oferece um atendente. Quem decide é o cliente.
+
+    Com a IA ligada, antes de admitir ele pergunta para a IA, que responde usando
+    só as informações da empresa. A pergunta é anotada mesmo assim: quando uma
+    pessoa aprova uma resposta oficial na planilha, aquela pergunta passa a ser
+    respondida pela regra, sem depender da IA.
     """
     _anotar_pergunta(sessao, texto, momento)
+    resposta_ia = _resposta_da_ia(sessao, texto)
+    if resposta_ia:
+        return f"{inicio}{resposta_ia}\n\n{_texto_para_continuar(sessao)}"
     return _perguntar_se_quer_atendente(sessao, inicio=inicio + TEXTO_NAO_SEI)
+
+
+# =================================================================
+# IA do Google: só onde as regras falham (veja o todos_ia.py)
+# =================================================================
+# Palavras com conteúdo que uma mensagem precisa ter para valer uma chamada à IA.
+# Numa resposta a uma pergunta do bot ("a capital do Tocantins"), duas bastam.
+# Numa mensagem solta, que pode ser só conversa ("vim pelo site"), pede três.
+IA_MINIMO_NA_RESPOSTA = 2
+IA_MINIMO_NA_MENSAGEM = 3
+
+# Palavras comuns num pedido de cotação que não trazem informação nova: o verbo,
+# a unidade, o nome do campo. Quando a frase tem SÓ isso, além das cidades e dos
+# números, as regras explicaram a mensagem inteira e a IA não precisa ser chamada.
+PALAVRAS_DO_PEDIDO = {
+    "COTACAO", "COTACOES", "COTAR", "COTA", "ORCAMENTO", "FRETE", "FRETES", "CARGA",
+    "CARGAS", "MERCADORIA", "MATERIAL", "KG", "KGS", "KILO", "KILOS", "QUILO", "QUILOS",
+    "TONELADA", "TONELADAS", "TON", "PESO", "PESA", "PESANDO", "VOLUME", "VOLUMES",
+    "CAIXA", "CAIXAS", "CM", "METRO", "METROS", "MEDIDA", "MEDIDAS", "ORIGEM", "DESTINO",
+    "SAI", "SAINDO", "SAIDA", "PARA", "PRA", "ATE", "DE", "DO", "DA", "EM", "NO", "NA",
+    "CNPJ", "CEP", "ENTREGA", "ENTREGAR", "COLETA", "COLETAR", "MANDAR", "ENVIAR",
+    "LEVAR", "TRANSPORTAR", "FAZER", "FAVOR", "GENTILEZA", "BOM", "BOA", "DIA",
+    "TARDE", "NOITE", "OLA", "QUERO", "QUERIA", "GOSTARIA", "PRECISO", "SEGUE",
+}
+
+
+def _contexto_do_campo(campo):
+    """'destino' -> 'a cidade de destino' (o que o bot tinha acabado de pedir)."""
+    return NOMES.get(campo, "").replace("*", "")
+
+
+def _ler_com_a_ia(sessao, texto, contexto=None, minimo=IA_MINIMO_NA_MENSAGEM):
+    """
+    Pede para a IA ler a mensagem, no máximo UMA vez por mensagem.
+
+    A mesma mensagem pode passar por mais de um ponto da conversa (o menu olha se é
+    cotação, e logo depois o "não sei" olha se é dúvida). A leitura fica guardada
+    na sessão, então a IA é chamada uma vez só. Isso deixa a resposta mais rápida
+    e economiza o limite gratuito.
+
+    Devolve o dicionário do todos_ia.interpretar, ou None (IA desligada, mensagem
+    sem conteúdo, ou falha do Google).
+    """
+    if not texto or not ia.ligada() or not ia.tem_conteudo(texto, minimo):
+        return None
+    chave = (normalizar(texto), contexto or "")
+    leituras = sessao.setdefault("ia_leituras", {})
+    if chave not in leituras:
+        if len(leituras) >= 10:           # guarda só as últimas, a sessão não cresce sem fim
+            leituras.clear()
+        leituras[chave] = ia.interpretar(texto, contexto)
+    return leituras[chave]
+
+
+def _resposta_da_ia(sessao, texto):
+    """A resposta da IA para uma dúvida, ou None."""
+    leitura = _ler_com_a_ia(sessao, texto, minimo=1)
+    if leitura and leitura["tipo"] == "duvida":
+        return leitura["resposta"]
+    return None
+
+
+def _cotacao_pela_ia(sessao, texto):
+    """
+    True quando a IA reconhece um pedido de cotação que as regras não reconheceram
+    ("preciso mandar umas caixas de Anápolis pra BH").
+    Se o pedido já traz dados da carga, a conversa vai pelo caminho rápido, igual
+    a quem escreve "Goiânia para Palmas, 50kg".
+    """
+    leitura = _ler_com_a_ia(sessao, texto)
+    if not leitura or leitura["tipo"] != "cotacao":
+        return False
+    if leitura["origem"] or leitura["destino"] or leitura["peso_kg"] or leitura["volumes"]:
+        sessao["modo_rapido"] = True
+    return True
+
+
+def _cidade_da_ia(nome):
+    """
+    Confere a cidade que a IA escreveu ("Palmas - TO") com a mesma lista de
+    cidades das regras. Só vale o nome exato, com o estado: cidade que não
+    existe, ou que existe em mais de um estado sem a sigla, devolve None.
+    """
+    if not nome:
+        return None
+    situacao, resultado = resolver_cidade(nome)
+    return resultado if situacao == "ok" else None
+
+
+def _numero_para_frase(numero):
+    """12.5 -> '12,5'   500.0 -> '500' (do jeito que as regras do bot leem)"""
+    return f"{numero:g}".replace(".", ",")
+
+
+def _frase_do_peso_e_das_medidas(leitura, dados):
+    """
+    Transforma o peso e as medidas que a IA leu numa frase simples, do jeito que
+    as regras do bot entendem:  "500 kg, 3 volumes de 50x40x30 cm"
+    Só entra o que ainda está faltando na cotação.
+    """
+    partes = []
+    if leitura["peso_kg"] and "peso" not in dados:
+        partes.append(f"{_numero_para_frase(leitura['peso_kg'])} kg")
+    if leitura["volumes"] and "medidas" not in dados and not dados.get("pulou_medidas"):
+        grupos = []
+        for volume in leitura["volumes"]:
+            medidas = "x".join(_numero_para_frase(m) for m in volume["medidas_cm"]) + " cm"
+            quantidade = volume["quantidade"]
+            if quantidade:
+                grupos.append(f"{quantidade} {'volume' if quantidade == 1 else 'volumes'} de {medidas}")
+            else:
+                grupos.append(medidas)
+        partes.append(" e ".join(grupos))
+    return ", ".join(partes)
+
+
+def _aplicar_leitura(sessao, leitura, texto):
+    """
+    Coloca na cotação o que a IA leu e ainda estava faltando, com as mesmas
+    conferências de sempre:
+      * a cidade só entra se existir na lista de cidades (_cidade_da_ia), e só
+        se a rota não começou por CEP (a rota não mistura cidade com CEP);
+      * o peso e as medidas viram uma frase simples ("500 kg, 3 volumes de
+        50x40x30 cm") e passam pelas regras que leem peso e medidas;
+      * o peso dado como limite ("mais de 500 kg") fica de fora, mesmo que a IA
+        tenha lido um número: o frete é cobrado por faixa de peso, então o bot
+        precisa do peso exato, e quem tem que dizer é o cliente.
+    Devolve a lista de confirmações para mostrar ao cliente (vazia se nada entrou).
+    """
+    if not leitura:
+        return []
+    dados = sessao["dados"]
+    confirmados = []
+    for campo in ("origem", "destino"):
+        if campo in dados:
+            continue
+        cidade = _cidade_da_ia(leitura[campo])
+        if cidade and _combina_com_a_rota(dados, por_cep=False):
+            confirmados.append(_guardar_ponta(dados, campo, cidade))
+    if peso_impreciso(texto):
+        leitura = dict(leitura, peso_kg=None)
+    frase = _frase_do_peso_e_das_medidas(leitura, dados)
+    if frase:
+        novos, _ = _absorver(sessao, frase)
+        confirmados += novos
+    return confirmados
+
+
+def _sobrou_texto(texto, dados):
+    """
+    True quando a mensagem tem palavras que as regras não explicaram.
+
+      "cotação de goiania go para palmas to, 50kg"       -> não sobra nada
+      "preciso levar meia tonelada para a capital do TO"   -> sobra "meia", "capital"
+
+    É o sinal de que a frase pode ter mais coisa do que as regras leram, e às
+    vezes de que elas leram errado: em "a capital do Tocantins", a regra acha a
+    cidade de Tocantins (MG), que existe, mas não é a que o cliente quis dizer.
+    """
+    explicadas = set(PALAVRAS_DO_PEDIDO) | ia.PALAVRAS_SEM_CONTEUDO
+    for campo in ("origem", "destino"):
+        if dados.get(campo):
+            explicadas |= set(normalizar(nome_completo(dados[campo])).split())
+    return any(len(p) >= 3 and not re.search(r"\d", p) and p not in explicadas
+               for p in normalizar(texto).split())
+
+
+def _confirmacoes_da_cotacao(dados):
+    """A lista do que o bot entendeu, montada a partir dos dados guardados."""
+    linhas = []
+    for campo, rotulo in (("origem", "Origem"), ("destino", "Destino")):
+        if dados.get(campo):
+            linha = f"{rotulo}: {nome_completo(dados[campo])}"
+            if dados.get(f"cep_{campo}"):
+                linha += f" (CEP {dados[f'cep_{campo}']})"
+            linhas.append(linha)
+    if "peso" in dados:
+        linhas.append(f"Peso: {formatar_numero(dados['peso'])} kg")
+    if dados.get("medidas"):
+        linhas.append("Medidas: " + _resumo_das_medidas(dados["medidas"]))
+    return linhas
+
+
+def _corrigir_rota_pela_ia(sessao, leitura, pontas):
+    """
+    As regras leram uma cidade, e a IA leu OUTRA, que também existe. Vale a da IA.
+
+    Isso acontece quando a frase cita a cidade de um jeito que a regra confunde:
+    "a capital do Tocantins" tem a palavra Tocantins, e existe uma cidade chamada
+    Tocantins em Minas Gerais. A regra pega essa; a IA entende Palmas.
+
+    Só são conferidas as pontas que ESTA mensagem preencheu (pontas). Uma cidade
+    que o cliente já tinha informado antes, numa mensagem só dela, fica como está.
+    A ponta informada por CEP também nunca é mexida: ali o cliente deu o número exato.
+    Devolve True quando trocou alguma ponta.
+    """
+    dados = sessao["dados"]
+    trocou = False
+    for campo in pontas:
+        if campo not in dados or not dados.get(f"cidade_{campo}_dita"):
+            continue
+        da_ia = _cidade_da_ia(leitura[campo])
+        if da_ia and da_ia != dados[campo]:
+            dados[campo] = da_ia
+            trocou = True
+    return trocou
+
+
+def _conferir_pedido_com_a_ia(sessao, texto, confirmados, contexto=None,
+                              pontas=("origem", "destino")):
+    """
+    O cliente mandou o pedido numa frase (abrindo a cotação, ou respondendo uma
+    pergunta do bot), e as regras deixaram faltar alguma coisa, ou não explicaram
+    a frase inteira. A IA lê a mesma frase:
+      * o que faltou e ela leu, entra (passando pelas regras de sempre);
+      * a cidade que as regras leram e ela leu diferente, troca pela dela;
+      * o peso e as medidas que as regras leram ficam como estão: número com
+        unidade a regra lê sem erro.
+    Devolve a lista de confirmações atualizada.
+    """
+    leitura = _ler_com_a_ia(sessao, texto, contexto, minimo=1)
+    if not leitura:
+        return confirmados
+    trocou = _corrigir_rota_pela_ia(sessao, leitura, pontas)
+    novos = _aplicar_leitura(sessao, leitura, texto)
+    if trocou:
+        return _confirmacoes_da_cotacao(sessao["dados"])
+    return confirmados + novos
+
+
+def _cidade_lida_pela_ia(sessao, texto, campo):
+    """
+    O bot pediu uma cidade e a resposta veio numa frase ("a capital do Tocantins").
+    Devolve a cidade que a IA leu, conferida na lista de cidades, ou None.
+    """
+    leitura = _ler_com_a_ia(sessao, texto, _contexto_do_campo(campo), minimo=1)
+    if not leitura:
+        return None
+    nome = leitura[campo]
+    outro = leitura["destino" if campo == "origem" else "origem"]
+    if not nome and outro:
+        nome = outro              # a IA pôs na outra ponta: vale para a que foi pedida
+    return _cidade_da_ia(nome)
+
+
+def _socorro_da_ia(telefone, sessao, momento, texto, campo):
+    """
+    O bot pediu uma informação da cotação e as regras não entenderam a resposta.
+    Antes de pedir de novo, a IA tenta:
+      1. ler a informação ("uns quinhentos quilos" -> 500 kg);
+      2. se era uma pergunta no meio da cotação, responder e pedir a informação de novo.
+    Devolve a resposta pronta, ou None quando a IA também não ajudou.
+    """
+    contexto = _contexto_do_campo(campo)
+    leitura = _ler_com_a_ia(sessao, texto, contexto, minimo=IA_MINIMO_NA_RESPOSTA)
+    if not leitura:
+        return None
+    if campo in ("origem", "destino") and campo not in sessao["dados"]:
+        cidade = _cidade_lida_pela_ia(sessao, texto, campo)
+        if cidade and _combina_com_a_rota(sessao["dados"], por_cep=False):
+            sessao["nao_entendeu"] = False
+            return _cidade_confirmada(telefone, sessao, momento, campo, cidade)
+    confirmados = _aplicar_leitura(sessao, leitura, texto)
+    if confirmados:
+        sessao["nao_entendeu"] = False
+        return _continuar(telefone, sessao, momento, confirmados)
+    if leitura["tipo"] == "duvida" and leitura["resposta"]:
+        sessao["nao_entendeu"] = False
+        return (f"{leitura['resposta']}\n\n"
+                f"Para continuar a cotação, me envie {_nome_da_rota(sessao, campo)}.\n\n"
+                f"{_pergunta_da_rota(sessao, campo)}")
+    return None
 
 
 def _anotar_pergunta(sessao, texto, momento=None):
@@ -1139,6 +1425,8 @@ def etapa_inicio(telefone, sessao, texto, momento):
     resposta_faq = faq.buscar_por_texto(texto)
     if resposta_faq:
         return f"{_saudacao_inicial()}{resposta_faq}\n\n" + texto_menu()
+    if _cotacao_pela_ia(sessao, texto):           # pedido que só a IA entendeu
+        return _saudacao_inicial() + iniciar_cotacao(telefone, sessao, momento, texto)
     if _e_pergunta_de_verdade(sessao, texto):     # já chegou perguntando algo que o bot não sabe
         return _nao_sei_responder(sessao, texto, momento, inicio=_saudacao_inicial())
     if _falta_nome(sessao):                       # sem CNPJ exigido, o nome é pedido aqui
@@ -1172,8 +1460,24 @@ def _pedir_cnpj(sessao, texto="", momento=None):
     # Pedido de cotação não entra aqui, mesmo escrito em forma de pergunta: para
     # cotar, o CNPJ é obrigatório, e é isso que o bot vai pedir logo abaixo.
     pedido_de_cotacao = quer_cotacao(normalizar(texto)) or _tem_dados_de_cotacao(texto)
-    if (texto and not pedido_de_cotacao and parece_pergunta(texto)
-            and _e_pergunta_de_verdade(sessao, texto)):
+    pergunta = bool(texto and not pedido_de_cotacao and parece_pergunta(texto)
+                    and _e_pergunta_de_verdade(sessao, texto))
+
+    # O que as regras não entenderam, a IA tenta: pode ser um pedido de cotação
+    # escrito de outro jeito (aí o CNPJ é pedido, como em qualquer cotação), ou
+    # uma dúvida que ela consegue responder com as informações da empresa.
+    if texto and not pedido_de_cotacao:
+        if _cotacao_pela_ia(sessao, texto):
+            pedido_de_cotacao, pergunta = True, False
+        elif pergunta:
+            resposta_ia = _resposta_da_ia(sessao, texto)
+            if resposta_ia:
+                _anotar_pergunta(sessao, texto, momento)
+                sessao["etapa"] = "cnpj"
+                sessao.pop("primeira_mensagem", None)
+                return f"{_saudacao_inicial()}{resposta_ia}\n\n{TEXTO_PEDIR_CNPJ}"
+
+    if pergunta:
         return _nao_sei_responder(sessao, texto, momento, inicio=_saudacao_inicial())
 
     sessao["primeira_mensagem"] = texto
@@ -1368,6 +1672,8 @@ def _seguir_depois_do_nome(telefone, sessao, momento, texto=""):
         resposta_faq = faq.buscar_por_texto(guardada)
         if resposta_faq:
             return f"{abertura}{resposta_faq}\n\n" + texto_menu()
+        if _cotacao_pela_ia(sessao, guardada):        # pedido que só a IA entendeu
+            return abertura + etapa_menu(telefone, sessao, guardada, momento)
         if _e_pergunta_de_verdade(sessao, guardada):
             return _nao_sei_responder(sessao, guardada, momento, inicio=abertura)
     return texto_convite(sessao)
@@ -1388,6 +1694,8 @@ def etapa_menu(telefone, sessao, texto, momento):
     resposta_faq = faq.buscar_por_texto(texto)
     if resposta_faq:
         return f"{resposta_faq}\n\n" + texto_menu()
+    if _cotacao_pela_ia(sessao, texto):           # pedido que só a IA entendeu
+        return iniciar_cotacao(telefone, sessao, momento, texto)
     if _e_pergunta_de_verdade(sessao, texto):
         return _nao_sei_responder(sessao, texto, momento)
     sessao["nao_entendeu"] = True
@@ -1402,6 +1710,14 @@ def iniciar_cotacao(telefone, sessao, momento, texto=""):
     sessao["dados"] = {}
     sessao.pop("registro", None)     # nova cotação: a linha da cotação anterior não é mais atualizada
     confirmados, _ = _absorver(sessao, texto) if texto else ([], "")
+    # Com a IA ligada, ela confere o pedido quando as regras deixaram faltar alguma
+    # coisa ("meia tonelada"), ou quando a frase tem mais do que as regras leram
+    # ("a capital do Tocantins"). Frase que as regras explicam inteira não vai para a IA.
+    if texto and ia.ligada():
+        falta = any(campo not in sessao["dados"] for campo in ("origem", "destino", "peso"))
+        if (falta and ia.tem_conteudo(texto, IA_MINIMO_NA_RESPOSTA)) \
+                or _sobrou_texto(texto, sessao["dados"]):
+            confirmados = _conferir_pedido_com_a_ia(sessao, texto, confirmados)
     if not confirmados:
         confirmados = ["Vamos lá! Para a cotação eu preciso da origem, do destino e do "
                        "peso da carga."]
@@ -1827,9 +2143,40 @@ def _pedir_de_novo(sessao, campo, motivo, texto_cliente=""):
 
 
 def etapa_coleta(telefone, sessao, texto, momento):
-    """Usada nas etapas 'origem', 'destino' e 'peso'."""
+    """
+    Usada nas etapas 'origem', 'destino' e 'peso'.
+
+    As regras tentam primeiro. Se elas não entenderem a resposta do cliente, e a
+    IA estiver ligada, a IA tenta antes de o bot pedir de novo. Peso dado como
+    limite ("mais de 100 kg") não vai para a IA: ali o bot precisa do número
+    exato, e quem tem que dizer é o cliente.
+    """
     campo = sessao["etapa"]
+    resposta = _coleta_pelas_regras(telefone, sessao, texto, momento, campo)
+    if (sessao.get("nao_entendeu") and sessao["etapa"] == campo
+            and not (campo == "peso" and peso_impreciso(texto))):
+        socorro = _socorro_da_ia(telefone, sessao, momento, texto, campo)
+        if socorro:
+            return socorro
+    return resposta
+
+
+def _coleta_pelas_regras(telefone, sessao, texto, momento, campo):
+    """A resposta da etapa de coleta usando as regras do bot (e a IA conferindo)."""
+    antes = set(sessao["dados"])
     confirmados, resto = _absorver(sessao, texto)
+
+    # A resposta tinha mais do que as regras explicaram: "a capital do Tocantins",
+    # ou o pedido inteiro mandado no lugar da cidade ("3 pacotes, meia tonelada,
+    # da capital de Goiás pra capital do Tocantins"). Com a IA ligada, ela confere
+    # ANTES de a cotação seguir, do mesmo jeito que na primeira mensagem: corrige
+    # a cidade que a regra leu errado e completa o que faltou. Se ficasse para
+    # depois, uma cotação completa já sairia calculada com a cidade errada.
+    preencheu = set(sessao["dados"]) - antes
+    if preencheu and ia.ligada() and _sobrou_texto(texto, sessao["dados"]):
+        pontas = [ponta for ponta in ("origem", "destino") if ponta in preencheu]
+        confirmados = _conferir_pedido_com_a_ia(sessao, texto, confirmados,
+                                                _contexto_do_campo(campo), pontas)
 
     # A mensagem já trouxe a informação desta etapa (ou um peso acima do limite)
     if campo in sessao["dados"] or sessao["dados"].get("peso", 0) > config.PESO_MAXIMO_KG:
@@ -1886,6 +2233,10 @@ def _receber_cidade(telefone, sessao, momento, texto, campo):
         cidade = achar_cidade_no_texto(texto)
         if cidade:
             situacao, resultado = "ok", cidade
+            # A frase tem mais coisa além da cidade ("a capital do Tocantins"). Com
+            # a IA ligada, ela confere: se ler outra cidade, que exista, vale a dela.
+            if ia.ligada() and _sobrou_texto(texto, {campo: cidade}):
+                resultado = _cidade_lida_pela_ia(sessao, texto, campo) or cidade
 
     if situacao == "ok":
         # A rota começou pelo CEP: a cidade não entra, para não misturar
@@ -1949,7 +2300,13 @@ def etapa_medidas(telefone, sessao, texto, momento):
 
     medidas = ler_medidas(texto)
     if medidas is None:
-        return _pedir_de_novo(sessao, "medidas", "Não consegui entender as medidas.", texto)
+        resposta = _pedir_de_novo(sessao, "medidas", "Não consegui entender as medidas.", texto)
+        # As regras não entenderam: com a IA ligada, ela tenta antes de pedir de novo
+        if sessao.get("nao_entendeu"):
+            socorro = _socorro_da_ia(telefone, sessao, momento, texto, "medidas")
+            if socorro:
+                return socorro
+        return resposta
     # Guarda se a quantidade foi dita pelo cliente em todos os volumes, ou suposta
     # pelo bot (1 volume) em algum deles
     sessao["dados"]["qtd_informada"] = quantidade_de_todos_informada(texto)
@@ -2073,6 +2430,8 @@ def etapa_pos_cotacao(telefone, sessao, texto, momento):
     resposta_faq = faq.buscar_por_texto(texto)
     if resposta_faq:
         return f"{resposta_faq}\n\n{OPCOES_POS_COTACAO}"
+    if _cotacao_pela_ia(sessao, texto):           # já emendou outro pedido de cotação
+        return iniciar_cotacao(telefone, sessao, momento, texto)
     if _e_pergunta_de_verdade(sessao, texto):
         return _nao_sei_responder(sessao, texto, momento)
     sessao["nao_entendeu"] = True

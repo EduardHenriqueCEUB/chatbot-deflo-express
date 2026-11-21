@@ -50,6 +50,10 @@ SENHAS_OBRIGATORIAS = {
     "EMAIL_ENDERECO": config.EMAIL_ENDERECO,
     "EMAIL_SENHA_APP": config.EMAIL_SENHA_APP,
 }
+# A chave da IA só é obrigatória com a IA ligada (IA_LIGADA, no todos_config.py).
+# Sem isso, a IA ficaria desligada em silêncio, e ninguém entenderia por quê.
+if config.IA_LIGADA:
+    SENHAS_OBRIGATORIAS["GEMINI_API_KEY"] = config.GEMINI_API_KEY
 
 
 def _conferir_senhas():

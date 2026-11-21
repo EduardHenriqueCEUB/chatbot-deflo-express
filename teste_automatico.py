@@ -50,10 +50,27 @@ Como criar um caso novo:
                   casos que testam justamente o pedido de CNPJ.
     com_nome   -> por padrão True: o caso começa como se o cliente já tivesse dito o
                   primeiro nome. Use False nos casos que testam a pergunta do nome.
+    ia         -> liga a IA do Google NESTE caso e diz o que ela "responde" para cada
+                  mensagem do cliente: {mensagem: resposta}. A IA também é de
+                  mentira: nada vai para o Google, e o teste roda sem internet nem chave.
+                  A resposta pode ser um dicionário (o JSON que a IA devolveria),
+                  um texto qualquer (para testar resposta que não dá para ler),
+                  "ERRO" (Google fora do ar) ou "LIMITE" (limite gratuito atingido).
+                  Mensagem que não está na lista recebe {"tipo": "outro"}.
+                  Sem o campo ia, a IA fica desligada, como no bot sem a IA.
+    ia_sem_chave -> True: a IA está ligada, mas sem a GEMINI_API_KEY
+    ia_chamadas -> quantas vezes a IA devia ser chamada na conversa inteira
+    ia_contexto -> pedaço de texto que precisa aparecer no contexto mandado para a IA
+                   (o que o bot tinha acabado de pedir ao cliente)
+    ia_recebe     -> pedaços que PRECISAM estar no texto mandado para a IA
+    ia_nao_recebe -> pedaços que NÃO podem sair para a IA (dados pessoais)
+    mesmo_valor_que -> outra conversa, SEM a IA, que precisa dar exatamente o mesmo
+                       valor de frete. É a prova de que a IA nunca mexe no preço.
   Os textos são comparados sem diferenciar maiúscula de minúscula e sem acento.
 """
 import argparse
 import csv
+import json
 import re
 import sys
 import unicodedata
@@ -66,6 +83,7 @@ import todos_cnpj as cnpj
 import todos_config as config
 import todos_conversa as conversa
 import todos_faq as faq
+import todos_ia as ia
 
 # CNPJ bem formado, usado para o teste começar depois da porta de entrada.
 CNPJ_DE_TESTE = "11.222.333/0001-81"   # já no formato guardado, com máscara
@@ -134,6 +152,11 @@ class AprendizadoDeMentira:
                 return resposta
         return None
 
+    @staticmethod
+    def respostas_aprovadas():
+        return [{"pergunta": pergunta, "resposta": resposta}
+                for pergunta, resposta in AprendizadoDeMentira.aprovadas.items()]
+
 
 # O todos_conversa.py importou essas funções para dentro dele,
 # então é ali que elas precisam ser trocadas.
@@ -157,6 +180,34 @@ def consulta_de_cep_de_mentira(cep_limpo):
 
 
 cep._consultar_viacep = consulta_de_cep_de_mentira
+
+
+# IA de mentira: o teste não manda nada para o Google, não precisa de chave e não
+# gasta o limite gratuito. Cada caso diz o que a IA "responderia" (campo ia), e
+# o teste confere o que o BOT faz com isso: se usa, se descarta, se confere nas regras.
+class IADeMentira:
+    respostas = {}      # mensagem do cliente (simplificada) -> o que a IA devolve
+    chamadas = []       # (mensagem do cliente, contexto) de cada chamada
+
+
+def consulta_de_ia_de_mentira(instrucoes, mensagem):
+    achado = re.search(r"<<<\n(.*)\n>>>", mensagem, re.DOTALL)
+    texto = achado.group(1) if achado else mensagem
+    contexto = re.search(r"Contexto: (.*)", mensagem)
+    IADeMentira.chamadas.append((texto, contexto.group(1) if contexto else ""))
+    resposta = IADeMentira.respostas.get(simplificar(texto), {"tipo": "outro"})
+    if resposta == "ERRO":
+        raise ia.ErroDaIA("Google fora do ar (de mentira)")
+    if resposta == "LIMITE":
+        ia._pausar_por_limite()          # igual ao que acontece com o Google de verdade
+        raise ia.ErroDaIA("limite gratuito atingido (de mentira)", 429)
+    if isinstance(resposta, str):
+        return resposta
+    return json.dumps(resposta, ensure_ascii=False)
+
+
+ia._consultar_gemini = consulta_de_ia_de_mentira
+ia.aprendizado = AprendizadoDeMentira
 
 
 # =================================================================
@@ -1338,6 +1389,257 @@ R$ 6.200,00
      "mensagens": ["1", "goiania go", "/audio"],
      "espera": ["mensagens escritas"],
      "evento": None},
+
+    # ---------- IA do Google (de mentira: nada vai para o Google) ----------
+    # Quando a IA NÃO é chamada
+    {"nome": "IA: frase que as regras entendem inteira não vai para a IA",
+     "mensagens": ["cotação de goiania go para palmas to, 50kg, 50x40x30"],
+     "ia": {},
+     "ia_chamadas": 0,
+     "espera": ["R$"],
+     "evento": "cotacao", "valor_preenchido": True},
+
+    {"nome": "IA: um 'oi' não vai para a IA",
+     "mensagens": ["oi"],
+     "ia": {},
+     "ia_chamadas": 0,
+     "evento": None},
+
+    {"nome": "IA: ligada no config, mas sem a chave, fica desligada",
+     "mensagens": ["vocês emitem certificado de origem?"],
+     "ia": {"vocês emitem certificado de origem?":
+            {"tipo": "duvida", "resposta": "Não deveria aparecer."}},
+     "ia_sem_chave": True,
+     "ia_chamadas": 0,
+     "espera": ["não sei te responder"],
+     "nao_espera": ["não deveria aparecer"],
+     "evento": None},
+
+    # Dúvidas
+    {"nome": "IA: responde a dúvida que o FAQ não cobre",
+     "mensagens": ["e se acontecer um acidente na estrada com a minha mercadoria?"],
+     "ia": {"e se acontecer um acidente na estrada com a minha mercadoria?":
+            {"tipo": "duvida",
+             "resposta": "Todas as nossas operações seguem com seguro da mercadoria, "
+                         "do começo ao fim da viagem."}},
+     "ia_chamadas": 1,
+     "espera": ["seguro da mercadoria", "Escolha uma opção"],
+     "nao_espera": ["não sei te responder"],
+     "anotou": True,
+     "evento": None},
+
+    {"nome": "IA: quando ela também não sabe, o bot admite como antes",
+     "mensagens": ["vocês emitem certificado de origem?"],
+     "ia": {"vocês emitem certificado de origem?": {"tipo": "duvida", "resposta": None}},
+     "ia_chamadas": 1,
+     "espera": ["não sei te responder", "falar com um atendente"],
+     "anotou": True,
+     "evento": None},
+
+    {"nome": "IA: resposta que fala de preço é jogada fora",
+     "mensagens": ["vocês emitem certificado de origem?"],
+     "ia": {"vocês emitem certificado de origem?":
+            {"tipo": "duvida", "resposta": "Sim, e o frete fica em torno de R$ 350,00."}},
+     "espera": ["não sei te responder"],
+     "nao_espera": ["R$", "350"],
+     "evento": None},
+
+    {"nome": "IA: Google fora do ar, o bot segue como sem a IA",
+     "mensagens": ["vocês emitem certificado de origem?"],
+     "ia": {"vocês emitem certificado de origem?": "ERRO"},
+     "espera": ["não sei te responder"],
+     "evento": None},
+
+    {"nome": "IA: resposta que não dá para ler, o bot segue como sem a IA",
+     "mensagens": ["vocês emitem certificado de origem?"],
+     "ia": {"vocês emitem certificado de origem?": "Desculpe, não entendi a pergunta."},
+     "espera": ["não sei te responder"],
+     "nao_espera": ["desculpe, não entendi a pergunta"],
+     "evento": None},
+
+    {"nome": "IA: limite gratuito atingido, o bot para de chamar por um tempo",
+     "mensagens": ["vocês emitem certificado de origem?",
+                   "e se acontecer um acidente na estrada com a minha mercadoria?"],
+     "ia": {"vocês emitem certificado de origem?": "LIMITE",
+            "e se acontecer um acidente na estrada com a minha mercadoria?":
+            {"tipo": "duvida", "resposta": "Não deveria aparecer."}},
+     "ia_chamadas": 1,
+     "nao_espera": ["não deveria aparecer"],
+     "evento": None},
+
+    {"nome": "IA: resposta no jeito do bot (sem emoji, sem 'vc', negrito do WhatsApp)",
+     "mensagens": ["consigo saber em que cidade o caminhão está agora?"],
+     "ia": {"consigo saber em que cidade o caminhão está agora?":
+            {"tipo": "duvida",
+             "resposta": "**Sim!** 😀 vc pode pedir a posição a um atendente, "
+                         "porque a operação tem rastreamento 24 horas."}},
+     # Com o emoji ainda lá, sobrariam dois espaços entre "*Sim!*" e "você"
+     "espera": ["*Sim!* você pode pedir"],
+     "nao_espera": ["**", " vc "],
+     "evento": None},
+
+    {"nome": "IA: dúvida no meio da cotação é respondida e a cotação continua",
+     "mensagens": ["quero fazer uma cotação", "goiania go",
+                   "e se acontecer um acidente na estrada com a minha mercadoria?"],
+     "ia": {"e se acontecer um acidente na estrada com a minha mercadoria?":
+            {"tipo": "duvida",
+             "resposta": "Todas as nossas operações seguem com seguro da mercadoria."}},
+     "ia_chamadas": 1,
+     "espera": ["seguro da mercadoria", "Para continuar a cotação", "cidade de destino"],
+     "nao_espera": ["não sei te responder"],
+     "evento": None},
+
+    # Leitura do pedido
+    {"nome": "IA: lê o pedido escrito do jeito do cliente (BH, meia tonelada)",
+     "mensagens": ["preciso mandar umas caixas de anapolis pra bh, meia tonelada"],
+     "ia": {"preciso mandar umas caixas de anapolis pra bh, meia tonelada":
+            {"tipo": "cotacao", "origem": "Anápolis - GO", "destino": "Belo Horizonte - MG",
+             "peso_kg": 500, "volumes": []}},
+     "ia_chamadas": 1,
+     "espera": ["Origem: Anápolis - GO", "Destino: Belo Horizonte - MG", "Peso: 500 kg",
+                "medidas"],
+     "evento": None},
+
+    {"nome": "IA: corrige a cidade que a regra leu errado (capital do Tocantins)",
+     "mensagens": ["preciso levar 300kg de goiania ate a capital do tocantins"],
+     "ia": {"preciso levar 300kg de goiania ate a capital do tocantins":
+            {"tipo": "cotacao", "origem": "Goiânia - GO", "destino": "Palmas - TO",
+             "peso_kg": 300, "volumes": []}},
+     "ia_chamadas": 1,
+     "espera": ["Destino: Palmas - TO", "Peso: 300 kg", "medidas"],
+     "nao_espera": ["Tocantins - MG"],
+     "evento": None},
+
+    {"nome": "IA: pedido inteiro do jeito do cliente vira a cotação certa, pela tabela",
+     "mensagens": ["preciso mandar 3 caixas de 50x40x30, meia tonelada, da capital de goiás "
+                   "pra capital do tocantins"],
+     "ia": {"preciso mandar 3 caixas de 50x40x30, meia tonelada, da capital de goiás "
+            "pra capital do tocantins":
+            {"tipo": "cotacao", "origem": "Goiânia - GO", "destino": "Palmas - TO",
+             "peso_kg": 500, "volumes": [{"quantidade": 3, "medidas_cm": [50, 40, 30]}]}},
+     "ia_chamadas": 1,
+     "espera": ["Origem: Goiânia - GO", "Destino: Palmas - TO", "Peso real: 500 kg"],
+     "nao_espera": ["Tocantins - MG", "Goiás - GO"],
+     "evento": "cotacao", "valor_preenchido": True,
+     "mesmo_valor_que": ["cotação de goiania go para palmas to, 500kg, 3 caixas de 50x40x30"]},
+
+    {"nome": "IA: pedido inteiro mandado no lugar da cidade de origem (depois do 1)",
+     "mensagens": ["1", "Preciso mandar 3 pacotes de 50x30x10, meia tonelada, "
+                        "da capital de goias pra capital do tocantins"],
+     "ia": {"Preciso mandar 3 pacotes de 50x30x10, meia tonelada, "
+            "da capital de goias pra capital do tocantins":
+            {"tipo": "cotacao", "origem": "Goiânia - GO", "destino": "Palmas - TO",
+             "peso_kg": 500, "volumes": [{"quantidade": 3, "medidas_cm": [50, 30, 10]}]}},
+     "ia_chamadas": 1,
+     "ia_contexto": "cidade de origem",
+     "espera": ["Origem: Goiânia - GO", "Destino: Palmas - TO", "Peso real: 500 kg"],
+     "nao_espera": ["Tocantins - MG", "Goiás - GO"],
+     "evento": "cotacao", "valor_preenchido": True,
+     "mesmo_valor_que": ["cotação de goiania go para palmas to, 500kg, 3 caixas de 50x30x10"]},
+
+    {"nome": "IA: cidade dita numa mensagem anterior não é trocada pela IA",
+     "mensagens": ["1", "goiania go", "a capital do tocantins, uns quinhentos quilos"],
+     # A IA erra e devolve outra origem: a origem já confirmada antes fica como está
+     "ia": {"a capital do tocantins, uns quinhentos quilos":
+            {"tipo": "cotacao", "origem": "Anápolis - GO", "destino": "Palmas - TO",
+             "peso_kg": 500, "volumes": []}},
+     "espera": ["Origem: Goiânia - GO", "Destino: Palmas - TO", "Peso: 500 kg", "medidas"],
+     "nao_espera": ["Anápolis", "Tocantins - MG"],
+     "evento": None},
+
+    {"nome": "IA: cidade inventada pela IA não entra, e o bot pergunta",
+     "mensagens": ["preciso mandar umas caixas de anapolis pra cidade nova do sul, meia tonelada"],
+     "ia": {"preciso mandar umas caixas de anapolis pra cidade nova do sul, meia tonelada":
+            {"tipo": "cotacao", "origem": "Anápolis - GO",
+             "destino": "Cidade Nova do Sul - GO", "peso_kg": 500, "volumes": []}},
+     "espera": ["cidade de destino"],
+     "nao_espera": ["Cidade Nova do Sul"],
+     "evento": None},
+
+    {"nome": "IA: lê a resposta da etapa ('a capital do Tocantins' vira Palmas)",
+     "mensagens": ["quero fazer uma cotação", "goiania go", "a capital do tocantins"],
+     "ia": {"a capital do tocantins": {"tipo": "cotacao", "destino": "Palmas - TO"}},
+     "ia_chamadas": 1,
+     "ia_contexto": "cidade de destino",
+     "espera": ["Destino: Palmas - TO", "peso"],
+     "nao_espera": ["Tocantins - MG"],
+     "evento": None},
+
+    {"nome": "IA: lê o peso escrito por extenso",
+     "mensagens": ["quero fazer uma cotação", "goiania go", "palmas to", "uns quinhentos quilos"],
+     "ia": {"uns quinhentos quilos": {"tipo": "cotacao", "peso_kg": 500}},
+     "ia_chamadas": 1,
+     "ia_contexto": "peso",
+     "espera": ["Peso: 500 kg", "medidas"],
+     "evento": None},
+
+    {"nome": "IA: peso dado como limite NÃO vai para a IA (o cliente diz o número)",
+     "mensagens": ["quero fazer uma cotação", "goiania go", "palmas to", "mais de 100 kg"],
+     "ia": {"mais de 100 kg": {"tipo": "cotacao", "peso_kg": 100}},
+     "ia_chamadas": 0,
+     "espera": ["peso exato"],
+     "evento": None},
+
+    {"nome": "IA: lê as medidas e o preço sai da tabela, igual sem a IA",
+     "mensagens": ["quero fazer uma cotação", "goiania go", "palmas to", "50kg",
+                   "duas caixas de meio metro cada lado"],
+     "ia": {"duas caixas de meio metro cada lado":
+            {"tipo": "cotacao", "volumes": [{"quantidade": 2, "medidas_cm": [50, 50, 50]}]}},
+     "ia_chamadas": 1,
+     "espera": ["R$"],
+     "evento": "cotacao", "valor_preenchido": True,
+     "mesmo_valor_que": ["cotação de goiania go para palmas to, 50kg, 2 caixas de 50x50x50"]},
+
+    {"nome": "IA: medida em polegadas NÃO vai para a IA",
+     "mensagens": ["quero fazer uma cotação", "goiania go", "palmas to", "50kg",
+                   "20x10x5 polegadas"],
+     "ia": {"20x10x5 polegadas":
+            {"tipo": "cotacao", "volumes": [{"quantidade": 1, "medidas_cm": [51, 25, 13]}]}},
+     "ia_chamadas": 0,
+     "espera": ["centímetros"],
+     "evento": None},
+
+    {"nome": "IA: pedido que só a IA entendeu, antes do CNPJ, é retomado depois dele",
+     "com_cnpj": False,
+     "mensagens": ["minha empresa fica em anapolis e o cliente é de palmas to, "
+                   "são uns 3 volumes pesando meia tonelada",
+                   "11222333000181"],
+     "ia": {"minha empresa fica em anapolis e o cliente é de palmas to, "
+            "são uns 3 volumes pesando meia tonelada":
+            {"tipo": "cotacao", "origem": "Anápolis - GO", "destino": "Palmas - TO",
+             "peso_kg": 500, "volumes": []}},
+     "ia_chamadas": 1,
+     "espera": ["Origem: Anápolis - GO", "Destino: Palmas - TO", "Peso: 500 kg", "medidas"],
+     "evento": None},
+
+    {"nome": "IA: peso dado como limite na frase inteira NÃO vira peso pela IA",
+     "mensagens": ["goiania go para palmas to, mais de 500 kg"],
+     "ia": {"goiania go para palmas to, mais de 500 kg":
+            {"tipo": "cotacao", "origem": "Goiânia - GO", "destino": "Palmas - TO",
+             "peso_kg": 500, "volumes": []}},
+     "espera": ["Peso Total"],
+     "nao_espera": ["Peso: 500 kg"],
+     "evento": None},
+
+    {"nome": "IA: CNPJ, CEP, e-mail e telefone não saem para o Google",
+     "mensagens": ["minha empresa é 11222333000181, cep de origem 74486-225, "
+                   "email fulano@empresa.com, fone (61) 99999-8888, "
+                   "quero mandar umas caixas pra bh"],
+     "ia": {},
+     "ia_chamadas": 1,
+     "ia_recebe": ["[CNPJ]", "[CEP]", "[E-MAIL]", "[TELEFONE]", "caixas pra bh"],
+     "ia_nao_recebe": ["11222333000181", "74486-225", "fulano@empresa.com", "99999-8888"],
+     "evento": None},
+
+    {"nome": "IA: outro pedido emendado depois da cotação",
+     "mensagens": ["cotação de goiania go para palmas to, 50kg, 50x40x30",
+                   "e de anapolis pra capital mineira, 80kg?"],
+     "ia": {"e de anapolis pra capital mineira, 80kg?":
+            {"tipo": "cotacao", "origem": "Anápolis - GO", "destino": "Belo Horizonte - MG",
+             "peso_kg": 80, "volumes": []}},
+     "ia_chamadas": 1,
+     "espera": ["Destino: Belo Horizonte - MG", "medidas"],
+     "evento": "cotacao"},
 ]
 
 
@@ -1419,6 +1721,15 @@ def rodar_caso(numero, caso):
     AprendizadoDeMentira.aprovadas = dict(caso.get("aprovadas", {}))
     telefone = f"55619{numero:08d}"
 
+    # A IA só fica ligada nos casos que dizem o que ela responde (campo ia)
+    # A chave é a mensagem já sem os dados pessoais, que é o que chega na IA
+    IADeMentira.respostas = {simplificar(ia.esconder_dados_pessoais(m)): r
+                             for m, r in caso.get("ia", {}).items()}
+    IADeMentira.chamadas = []
+    config.IA_LIGADA = "ia" in caso
+    config.GEMINI_API_KEY = "" if caso.get("ia_sem_chave") or "ia" not in caso else "chave-de-teste"
+    ia._pausa_ate = 0.0
+
     # A conversa começa pedindo o CNPJ e depois o nome. Nos casos que não estão
     # testando essas duas portas, o teste já entra com as duas respondidas, para
     # medir só o que interessa.
@@ -1488,7 +1799,46 @@ def rodar_caso(numero, caso):
         if veio != esperado:
             problemas.append(f'{nome_coluna} era "{esperado}" e veio "{veio}"')
 
+    if "ia_chamadas" in caso and len(IADeMentira.chamadas) != caso["ia_chamadas"]:
+        problemas.append(f'a IA devia ser chamada {caso["ia_chamadas"]} vez(es) '
+                         f'e foi chamada {len(IADeMentira.chamadas)}')
+
+    if "ia_contexto" in caso:
+        contextos = simplificar(" | ".join(c for _, c in IADeMentira.chamadas))
+        if simplificar(caso["ia_contexto"]) not in contextos:
+            problemas.append(f'o contexto mandado para a IA devia falar de "{caso["ia_contexto"]}"')
+
+    enviados = simplificar(" | ".join(m for m, _ in IADeMentira.chamadas))
+    for pedaco in caso.get("ia_recebe", []):
+        if simplificar(pedaco) not in enviados:
+            problemas.append(f'faltou "{pedaco}" no texto mandado para a IA')
+    for pedaco in caso.get("ia_nao_recebe", []):
+        if simplificar(pedaco) in enviados:
+            problemas.append(f'"{pedaco}" não podia ter saído para a IA')
+
+    if "mesmo_valor_que" in caso:
+        valor_com_ia = linha.get("valor") if linha else None
+        valor_sem_ia = _valor_sem_a_ia(caso["mesmo_valor_que"])
+        if not valor_com_ia or valor_com_ia != valor_sem_ia:
+            problemas.append(f"o valor com a IA ({valor_com_ia}) devia ser igual ao valor "
+                             f"sem a IA ({valor_sem_ia})")
+
     return (not problemas), "; ".join(problemas), resposta
+
+
+def _valor_sem_a_ia(mensagens):
+    """Roda outra conversa, com a IA desligada, e devolve o valor da cotação."""
+    ligada = config.IA_LIGADA
+    config.IA_LIGADA = False
+    telefone = "5561999999999"
+    conversa.sessoes[telefone] = {"etapa": "inicio", "dados": {}, "ultima": MOMENTO,
+                                  "cnpj": CNPJ_DE_TESTE, "nome": NOME_DE_TESTE}
+    PlanilhaDeMentira.ultima = None
+    for mensagem in mensagens:
+        conversa.responder(telefone, mensagem, MOMENTO)
+    config.IA_LIGADA = ligada
+    linha = PlanilhaDeMentira.ultima
+    return linha.get("valor") if linha else None
 
 
 def main():

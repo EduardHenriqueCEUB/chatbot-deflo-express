@@ -39,6 +39,13 @@ def mostrar(resposta):
 
 telefone = "5561900000001"
 print("=== Simulador do chatbot Deflo Express ===")
+# Mostra se a IA do Google vai ajudar nesta conversa (IA_LIGADA, no todos_config.py)
+if not conversa.config.IA_LIGADA:
+    print("IA do Google: desligada")
+elif not conversa.config.GEMINI_API_KEY:
+    print("IA do Google: ligada no todos_config.py, mas falta a GEMINI_API_KEY no .env (fica desligada)")
+else:
+    print(f"IA do Google: LIGADA (modelo {conversa.config.IA_MODELO})")
 print("Digite como se fosse o cliente.")
 print("/novo = cliente novo | /esperar 10 = passar 10 min | /audio = mandar áudio | /sair = encerrar\n")
 
